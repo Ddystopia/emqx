@@ -1,0 +1,1 @@
+Fixed a connection crash with `{key_exists, Id}` that lost the in-memory session and its message queue. The crash occurred when the outgoing packet id counter wrapped onto an id still waiting for an ack. The session now skips ids in flight.

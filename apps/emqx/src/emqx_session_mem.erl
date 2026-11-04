@@ -527,7 +527,7 @@ deliver_msg(_ClientInfo, Msg = #message{qos = ?QOS_0}, Session) ->
 deliver_msg(
     ClientInfo,
     Msg = #message{qos = QoS},
-    Session = #session{next_pkt_id = PacketId, inflight = Inflight}
+    Session = #session{next_pkt_id = NextPacketId, inflight = Inflight}
 ) when
     QoS =:= ?QOS_1 orelse QoS =:= ?QOS_2
 ->
@@ -543,10 +543,13 @@ deliver_msg(
             %% Note that we publish message without shared ack header
             %% But add to inflight with ack headers
             %% This ack header is required for redispatch-on-terminate feature to work
+            PacketId = free_pkt_id(NextPacketId, Inflight),
             Publish = {PacketId, maybe_ack(Msg)},
             MarkedMsg = mark_begin_deliver(Msg),
             Inflight1 = emqx_inflight:insert(PacketId, with_ts(MarkedMsg), Inflight),
-            {ok, [Publish], next_pkt_id(Session#session{inflight = Inflight1})}
+            {ok, [Publish], Session#session{
+                next_pkt_id = pkt_id_after(PacketId), inflight = Inflight1
+            }}
     end.
 
 -spec enqueue(clientinfo(), [emqx_types:message()], session()) ->
@@ -812,10 +815,20 @@ redispatch_shared_messages(#session{inflight = Inflight, mqueue = Q}) ->
 obtain_next_pkt_id(Session) ->
     {Session#session.next_pkt_id, next_pkt_id(Session)}.
 
-next_pkt_id(Session = #session{next_pkt_id = ?MAX_PACKET_ID}) ->
-    Session#session{next_pkt_id = 1};
 next_pkt_id(Session = #session{next_pkt_id = Id}) ->
-    Session#session{next_pkt_id = Id + 1}.
+    Session#session{next_pkt_id = pkt_id_after(Id)}.
+
+pkt_id_after(?MAX_PACKET_ID) -> 1;
+pkt_id_after(Id) -> Id + 1.
+
+%% The counter wraps onto ids that are still inflight when acks arrive out of order.
+%% The inflight limit is at most 65535 and the caller checks `emqx_inflight:is_full/1`,
+%% so a free id exists.
+free_pkt_id(Id, Inflight) ->
+    case emqx_inflight:contain(Id, Inflight) of
+        true -> free_pkt_id(pkt_id_after(Id), Inflight);
+        false -> Id
+    end.
 
 %%--------------------------------------------------------------------
 %% Will message handling

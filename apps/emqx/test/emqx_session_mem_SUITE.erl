@@ -598,8 +598,110 @@ t_obtain_next_pkt_id(_) ->
     {1, Session2} = emqx_session_mem:obtain_next_pkt_id(Session1),
     ?assertEqual(2, emqx_session_mem:info(next_pkt_id, Session2)).
 
+t_deliver_pkt_id_wrap_nothing_inflight(_) ->
+    Session = session(#{next_pkt_id => 16#FFFF}),
+    Delivers = enrich([delivery(?QOS_1, T) || T <- [<<"t1">>, <<"t2">>, <<"t3">>]], Session),
+    {ok, [{16#FFFF, _}, {1, _}, {2, _}], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, Session),
+    ?assertEqual(3, emqx_session_mem:info(next_pkt_id, Session1)).
+
+t_deliver_pkt_id_wrap_skips_inflight(_) ->
+    Session = session(#{inflight => inflight(0, [1]), next_pkt_id => 16#FFFF}),
+    Delivers = enrich([delivery(?QOS_1, T) || T <- [<<"t1">>, <<"t2">>]], Session),
+    {ok, [{16#FFFF, Msg1}, {2, Msg2}], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, Session),
+    ?assertEqual(<<"t1">>, emqx_message:topic(Msg1)),
+    ?assertEqual(<<"t2">>, emqx_message:topic(Msg2)),
+    ?assertEqual(3, emqx_session_mem:info(inflight_cnt, Session1)),
+    ?assertEqual(3, emqx_session_mem:info(next_pkt_id, Session1)).
+
+t_dequeue_pkt_id_wrap_skips_inflight(_) ->
+    Session = session(#{inflight => inflight(2, [1, 16#FFFF]), next_pkt_id => 1}),
+    Session1 = emqx_session_mem:enqueue(clientinfo(), [message(<<"t1">>)], Session),
+    {ok, _, [{2, Msg}], Session2} = emqx_session_mem:puback(clientinfo(), 16#FFFF, Session1),
+    ?assertEqual(<<"t1">>, emqx_message:topic(Msg)),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, Session2)),
+    ?assertEqual(3, emqx_session_mem:info(next_pkt_id, Session2)).
+
+t_deliver_pkt_id_wrap_skips_consecutive_inflight(_) ->
+    Session = session(#{inflight => inflight(0, lists:seq(1, 5)), next_pkt_id => 16#FFFF}),
+    Delivers = enrich([delivery(?QOS_1, T) || T <- [<<"t1">>, <<"t2">>]], Session),
+    {ok, [{16#FFFF, _}, {6, _}], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, Session),
+    ?assertEqual(7, emqx_session_mem:info(next_pkt_id, Session1)).
+
+t_deliver_pkt_id_skips_qos2_awaiting_pubcomp(_) ->
+    Session = session(),
+    {ok, [{1, _}], Session1} = emqx_session_mem:deliver(
+        clientinfo(), enrich(delivery(?QOS_2, <<"t0">>), Session), Session
+    ),
+    {ok, _, Session2} = emqx_session_mem:pubrec(1, Session1),
+    Session3 = emqx_session_mem:set_field(next_pkt_id, 1, Session2),
+    {ok, [{2, _}], _} = emqx_session_mem:deliver(
+        clientinfo(), enrich(delivery(?QOS_1, <<"t1">>), Session3), Session3
+    ).
+
+t_deliver_pkt_id_ignores_awaiting_rel(_) ->
+    Session = session(#{awaiting_rel => #{1 => ts(millisecond)}}),
+    {ok, [{1, _}], Session1} = emqx_session_mem:deliver(
+        clientinfo(), enrich(delivery(?QOS_1, <<"t1">>), Session), Session
+    ),
+    ?assertEqual(1, emqx_session_mem:info(awaiting_rel_cnt, Session1)).
+
+t_deliver_last_free_pkt_id_behind_counter(_) ->
+    Free = 1000,
+    Ids = lists:seq(1, 16#FFFF) -- [Free],
+    Session = session(#{inflight => inflight(16#FFFF, Ids), next_pkt_id => Free + 1}),
+    {ok, [{Free, _}], Session1} = emqx_session_mem:deliver(
+        clientinfo(), enrich(delivery(?QOS_1, <<"t1">>), Session), Session
+    ),
+    ?assertEqual(Free + 1, emqx_session_mem:info(next_pkt_id, Session1)),
+    ?assertEqual(16#FFFF, emqx_session_mem:info(inflight_cnt, Session1)).
+
+t_all_pkt_ids_in_use(_) ->
+    Session = session(#{
+        inflight => inflight(16#FFFF, lists:seq(1, 16#FFFF)),
+        next_pkt_id => 1
+    }),
+    Delivers = enrich([delivery(?QOS_1, T) || T <- [<<"t1">>, <<"t2">>]], Session),
+    {ok, [], Session1} = emqx_session_mem:deliver(clientinfo(), Delivers, Session),
+    ?assertEqual(16#FFFF, emqx_session_mem:info(inflight_cnt, Session1)),
+    ?assertEqual(2, emqx_session_mem:info(mqueue_len, Session1)),
+    ?assertEqual(1, emqx_session_mem:info(next_pkt_id, Session1)),
+    {ok, _, [{777, Msg1}], Session2} = emqx_session_mem:puback(clientinfo(), 777, Session1),
+    ?assertEqual(<<"t1">>, emqx_message:topic(Msg1)),
+    ?assertEqual(1, emqx_session_mem:info(mqueue_len, Session2)),
+    ?assertEqual(778, emqx_session_mem:info(next_pkt_id, Session2)),
+    {ok, _, [{5, Msg2}], Session3} = emqx_session_mem:puback(clientinfo(), 5, Session2),
+    ?assertEqual(<<"t2">>, emqx_message:topic(Msg2)),
+    ?assertEqual(0, emqx_session_mem:info(mqueue_len, Session3)),
+    ?assertEqual(6, emqx_session_mem:info(next_pkt_id, Session3)).
+
+t_replay_after_pkt_id_wrap_keeps_ids(_) ->
+    Session = session(#{inflight => inflight(0, [1]), next_pkt_id => 16#FFFF}),
+    Delivers = enrich([delivery(?QOS_1, T) || T <- [<<"t1">>, <<"t2">>]], Session),
+    {ok, [{16#FFFF, _}, {2, _}], Session1} =
+        emqx_session_mem:deliver(clientinfo(), Delivers, Session),
+    Session2 = emqx_session_mem:enqueue(clientinfo(), [message(<<"t3">>)], Session1),
+    {ok, Replies, _} = emqx_session_mem:replay(clientinfo(), Session2),
+    ?assertEqual(
+        [{1, true}, {2, true}, {16#FFFF, true}, {3, false}],
+        [{Id, emqx_message:get_flag(dup, Msg)} || {Id, Msg} <- Replies]
+    ).
+
 %% Helper functions
 %%--------------------------------------------------------------------
+
+message(Topic) ->
+    emqx_message:make(test, ?QOS_1, Topic, <<>>).
+
+inflight(MaxSize, PacketIds) ->
+    Msg = message(<<"inflight">>),
+    lists:foldl(
+        fun(PacketId, Acc) -> emqx_inflight:insert(PacketId, with_ts(wait_ack, Msg), Acc) end,
+        emqx_inflight:new(MaxSize),
+        PacketIds
+    ).
 
 mqueue() -> mqueue(#{}).
 mqueue(Opts) ->
